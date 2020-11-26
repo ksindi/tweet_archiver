@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import os
@@ -13,12 +14,12 @@ config = {
     k: os.getenv(k, default)
     for k, default in [
         ("APP_ENV", "local"),
-        ("ARCHIVE_DAYS", 365),
-        ("DYNAMODB_TABLE_NAME", "Test2"),
+        ("DAYS_TO_KEEP", 365),
+        ("DYNAMODB_TABLE_NAME", "Test6"),
         ("LOG_LEVEL", "INFO"),
         ("TWITTER_CONSUMER_KEY", ""),
         ("TWITTER_CONSUMER_SECRET_KEY", ""),
-        ("TWITTER_ACCESS_TOKEN", ""),
+        ("TWITTER_ACCESS_TOKEN", "Defined "),
         ("TWITTER_ACCESS_TOKEN_SECRET", ""),
         ("TWITTER_SCREEN_NAME", "kamilsindi"),
     ]
@@ -35,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 MAX_ID_KEY = 0
 
-def maybe_create_dynamodb_table(table_name: str):
+
+def create_dynamodb_table(table_name: str):
     """Create DynamoDB table"""
     dynamodb = boto3.resource("dynamodb")
 
@@ -56,7 +58,7 @@ def maybe_create_dynamodb_table(table_name: str):
         logger.info("table status: %s", table.table_status)
 
 
-def initialize_twitter_client(config: dict):
+def initialize_twitter_client():
     """Authorize twitter, initialize tweepy"""
     auth = tweepy.OAuthHandler(
         config["TWITTER_CONSUMER_KEY"], config["TWITTER_CONSUMER_SECRET_KEY"]
@@ -64,7 +66,14 @@ def initialize_twitter_client(config: dict):
     auth.set_access_token(
         config["TWITTER_ACCESS_TOKEN"], config["TWITTER_ACCESS_TOKEN_SECRET"]
     )
-    return tweepy.API(auth)
+    api = tweepy.API(auth, wait_on_rate_limit_notify=True, wait_on_rate_limit=True)
+
+    try:
+        api.me()
+    except tweepy.error.TweepError as e:
+        logger.error("please check the authentication information:\n%s", str(e))
+    else:
+        return api
 
 
 def get_tweets(name: str, query_id: int = None) -> List[dict]:
@@ -77,13 +86,13 @@ def get_tweets(name: str, query_id: int = None) -> List[dict]:
     else:
         query_key = "since_id"
 
-    api = initialize_twitter_client(config)
+    api = initialize_twitter_client()
 
     tweets = []
 
     # Twitter only allows access to a users most recent 3240 tweets with this method
     # keep grabbing tweets until there are no tweets left to grab; max count is 200
-    while (len(arr := api.user_timeline(screen_name=name, count=200, **{query_key: query_id})) > 0):
+    while len(arr := api.user_timeline(name, count=200, **{query_key: query_id})) > 0:
         tweets.extend(arr)
 
         if query_key == "max_id":
@@ -93,6 +102,9 @@ def get_tweets(name: str, query_id: int = None) -> List[dict]:
 
         logger.info("%d tweets downloaded so far", len(tweets))
 
+        # TODO remove
+        break
+
     return tweets
 
 
@@ -101,12 +113,27 @@ def get_max_id_stored(table_name: str):
     dynamodb = boto3.resource("dynamodb")
 
     table = dynamodb.Table(table_name)
-    # get latest id in descending order
-    response = table.get_item(Key={"id": MAX_ID_KEY})
-    if "Items" not in response:
+
+    # basic retry logic
+    attempts = 4
+    for i in range(1, attempts + 1):
+        try:
+            # get latest id in descending order
+            response = table.get_item(Key={"id": MAX_ID_KEY})
+        except dynamodb.meta.client.exceptions.ResourceNotFoundException:
+            sleep = i * 5
+            attempts -= 1
+            logger.info("table not found. retrying in %d seconds. attempt #: %d", sleep, attempts)
+            time.sleep(sleep)
+            continue
+        else:
+            break
+
+    logger.debug(response)
+    if "Item" not in response:
         return None
     else:
-        return response["Items"][0]
+        return response["Item"]["max_id"]
 
 
 def put_tweets_in_dynamodb(table_name: str, tweets: List[dict]) -> None:
@@ -119,14 +146,17 @@ def put_tweets_in_dynamodb(table_name: str, tweets: List[dict]) -> None:
 
     max_id = tweets[0].id
 
-    for tweet in tweets:
-        max_id = max(max_id, tweet.id)
-        table.put_item(Item={"id": tweet.id, "tweet": tweet._json})
+    with table.batch_writer() as batch:
+        for tweet in tweets:
+            max_id = max(max_id, tweet.id)
+            table.put_item(
+                Item={"id": tweet.id, "json": json.dumps(tweet._json)}
+            )
 
     return max_id
 
 
-def store_max_id(max_id: int):
+def store_max_id(table_name: str, max_id: int):
     # create dynamodb resource object
     client = boto3.resource("dynamodb")
     table = client.Table(table_name)
@@ -135,28 +165,31 @@ def store_max_id(max_id: int):
     table.put_item(Item={"id": MAX_ID_KEY, "max_id": max_id})
 
 
-def delete_tweets(api: tweepy.API, archive_days: int):
+def delete_tweets(api: tweepy.API, days_to_keep: int):
     """Delete tweets in DynamoDB older than a certain date"""
     # Scan for tweets not deleted beofore a certain date
     # Delete tweets
     # Add attribute as deleted in dynamodb
     # TODO
+    cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=days_to_keep)
+
     return
 
 
 if __name__ == "__main__":
-    maybe_create_dynamodb_table(config["DYNAMODB_TABLE_NAME"])
+    create_dynamodb_table(config["DYNAMODB_TABLE_NAME"])
 
     max_id = get_max_id_stored(config["DYNAMODB_TABLE_NAME"])
 
-    logger.info("Found max id: %s", max_id)
-
+    logger.info("found max id: %s", max_id)
     tweets = get_tweets(config["TWITTER_SCREEN_NAME"], max_id)
 
     logger.info("%d tweets found", len(tweets))
 
     if tweets:
         new_max_id = put_tweets_in_dynamodb(config["DYNAMODB_TABLE_NAME"], tweets)
+
+        logger.info("updating max_id to %d", new_max_id)
         store_max_id(config["DYNAMODB_TABLE_NAME"], new_max_id)
 
     # TODO
